@@ -13,6 +13,7 @@ knitr::opts_chunk$set(echo = TRUE)
 ```{r}
 library(ggplot2)
 library(tidyverse)
+library(patchwork)
 ```
 
 
@@ -49,7 +50,7 @@ Plotting survival, growth/shrinkage/stasis, number of seeds, and size of recruit
 
 ```{r}
 survival.plot=ggplot(d, aes(x = size, y = surv))+
-  geom_point(position = "jitter")+
+  geom_point()+
   xlab("Size (t)")+
   ylab("Survival to t+1")
 survival.plot
@@ -71,7 +72,6 @@ recruit.size.plot=ggplot(recruit.size, aes(sizeNext))+
   geom_histogram(bins = 11, fill="white", color="black")
   xlab("Recruit Size")
 recruit.size.plot
-
 ```
 
 ## Build regression for vital rate functions
@@ -106,7 +106,7 @@ params$surv.int = coefficients(surv.reg)[1]
 params$surv.slope = coefficients(surv.reg)[2]
 ```
 
-Growth is often modelled with a linear regression, which is taken as the mean of normal (or log-normal) distribution. The linear regression describes the expected size at the next census while the normal distribution describes the range of possible sizes about this expectation. The variance of the normal distribution is often taken to be equal to the variance of the residuals from the linear regression.
+Growth is often modelled with a linear regression, which is taken as the mean of normal (or log-normal) distribution. The linear regression describes the expected size at the next census while the normal distribution describes the range of possible sizes about this expectation. The variance of the normal distribution is often taken to be equal to the variance of the residuals from the linear regression (Figure 1b in MS).
 
 ```{r}
 # growth: linear regression
@@ -120,7 +120,7 @@ params$growth.slope = coefficients(growth.reg)[2]
 params$growth.sd = sd(resid(growth.reg))
 ```
 
-For fecundity, we are pooling all individuals into this regression regardless of whether they flowered or not. The number of offspring is typically treated as count data and modelled using Poisson regression (a generalized linear model with a log link function).
+For fecundity, we are pooling all individuals into this regression regardless of whether they flowered or not. The number of offspring is typically treated as count data and modelled using Poisson regression (a generalized linear model with a log link function). Could use Negative Binomial here. 
 
 ```{r}
 # seeds: Poisson regression
@@ -135,7 +135,7 @@ params$seed.slope = coefficients(seed.reg)[2]
 
 In the data frame, recruits are those individuals who have a value for sizeNext but not for size. We simply take the mean and standard deviation of their size for use in a normal distribution. We assume that offspring size is independent of maternal size so we only need to describe the distribution of offspring in terms of its mean and variance. 
 
-When parentage is unknown, it is common to model the size distribution of recruits as a normal or log-normal distribution fit tot he sizes of recruits at t+1.
+When parentage is unknown, it is common to model the size distribution of recruits as a normal or log-normal distribution fit to the sizes of recruits at t+1.
 
 ```{r}
 # Size distribution of recruits
@@ -189,10 +189,13 @@ recruit.size = d %>%
 xx=seq(0,8,by=.01) # sizes at which to evaluate predictions
 
 recruit.size.plot=ggplot(recruit.size, aes(x = sizeNext))+
-  geom_histogram(aes(y = ..density..), bins = 11, col = "black", fill = "white")+
+  geom_histogram(aes(y = after_stat(density)), bins = 11, col = "black", fill = "white")+
   xlab("Recruit Size")+
   stat_function(fun=function(xx) dnorm(xx, mean = params$recruit.size.mean, sd = params$recruit.size.sd), col="red", linewidth=3)
 recruit.size.plot
+
+
+# instead of stat_function, use geom_function(fun = ~ donorm(xx, mean = , sd = ))
 
 ```
 
@@ -206,7 +209,7 @@ In this very simple example, we model (1) survival, (2) growth, (3) seed number,
 # survival probability function, this is a logistic function
 s.x = function(x, params){
   u = exp(params$surv.int+params$surv.slope*x)
-  return(u/(1+u))
+  return(u/(1+u)) # this is back transforming
 }
 ```
 
@@ -215,13 +218,14 @@ s.x = function(x, params){
 g.yx = function(xp,x,params){
   dnorm(xp, mean = params$growth.int+params$growth.slope*x, sd = params$growth.sd)
 }
+# xp means to estimate the probability density of all size at t+1
 ```
 
 ```{r}
-# reproduction function, this is a constant times a normal distribution times an exponential function
+# reproduction function, this is a constant times a normal distribution times an exponential function, think of this as expected offspring not just number of seeds
 f.yx = function(xp,x,params){
   params$establishment.prob*dnorm(xp,mean = params$recruit.size.mean, sd = params$recruit.size.sd)*exp(params$seed.int+params$seed.slope*x)
-}
+} # exp because back-transforming from log in Poisson
 ```
 
 ## Make a kernel
@@ -236,8 +240,8 @@ To integrate, we begin by defining:
 * the integration limits (min.size and max. size) span the range of sizes observed int eh ata set, and then some.
 
 ```{r}
-min.size = 0.9*min(c(d$size,d$sizeNext),na.rm = T)
-max.size = 1.1*max(c(d$size,d$sizeNext),na.rm = T)
+min.size = 0.9*min(c(d$size,d$sizeNext),na.rm = T) # 90% of the smallest
+max.size = 1.1*max(c(d$size,d$sizeNext),na.rm = T) # 110% of largest
 n = 100 # number of cells in the matrix # typically between 50 and 200
 b = min.size+c(0:n)*(max.size-min.size)/n # boundary points
 y = 0.5*(b[1:n]+b[2:(n+1)]) # mesh points

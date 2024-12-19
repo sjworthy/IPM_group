@@ -1,0 +1,397 @@
+---
+title: "Appendix.C"
+output: 
+  html_document: 
+    keep_md: yes
+date: "2024-12-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Working through example in Appendix C of Merow et al. (2014) MEE. How to build an IPM for the plant Hypericum cumulicola including both discrete and continuous stages. Estimate vital rates for two transitions, 1994-1995 and 1996-1997. 
+
+Plan is to go back and forth between using IPMpack like in the Appendix and then writing the code on my own. 
+
+```{r}
+install.packages("~/Downloads/IPMpack_2.1.tar.gz", repos = NULL)
+```
+
+```{r}
+library(IPMpack)
+library(tidyverse)
+library(broom)
+library(magrittr)
+```
+
+Read in the data
+
+```{r}
+data(dataIPMpackHypericumCov)
+d = dataIPMpackHypericumCov
+```
+
+This data set contains the variables size and sizeNext, measured as the maximum stem height (cm) of individuals in the populatiion bald 1 at times t and t+1, respectively, as well as the variable surv, i.e. whethere individuals survived (=1) or not (=0) from time t to time t+1.
+
+It also contains the probability of being reproductive (fec0), the number of fruits produced per individual (fec1), the number of seeds per fruit (fec2). Columns fec3 and fec4 concern the probability of germination and the probability of seedling survival within the year of seed and seedling production, respectively, while goSB and staySB are constants describing the dynamics of the seed bank that are explained below.
+
+
+```{r}
+help("dataIPMpackHypericumCov")
+head(d)
+```
+
+We will analyze only a subset of the data for the first two annual periods: 1994-1995, and 1996-1997. We know a priori that these years were very different in terms of precipitation. 
+
+Only keeps individuals that have an size value and if size = NA then ontogenyNext has to equal 1 meaning the individual is a new recruit in time t+1.
+
+```{r}
+d1 <- subset(d,is.na(d$size)==FALSE | d$ontogenyNext==1)
+```
+
+Years of focus
+
+```{r}
+d1 <- subset(d1,d1$year==1994 | d1$year==1996)
+```
+
+Additional data
+
+```{r}
+fec2 = 13.78 # number of seeds produced per fruit
+fec3 = 0.001336 # probability of germination within year of seed production
+fec4 = 0.14 # probability of seedling survival from the time of germination to the time of the next annual census t+1, corresponding to approximately 6 months
+goSB = 0.08234528 # probability of a seed entering the seed bank
+staySB = 0.671 # probability of a seed staying in the seed bank
+```
+
+Organizing the data
+
+```{r}
+d1 <- d1[,c("year","size","surv","sizeNext","fec0","fec1")]
+head(d1)
+tail(d1)
+```
+
+Understanding how data should be organized. 
+
+Individuals that survive from time t to time t+1 (surv = 1) will have data for both the variables size and sizeNext, as is the case for the individuals in rows 51-53. An individual that dies (surv = 0) will have sizeNext = NA, as is the case for the individual in row 55. The same rational applies to fecundity data: if an individual at time t is not reproductive (fec0 = 0), fecundity variables that are conditional on fec0 must be NA (fec1 = NA). Not that an individual's probability of reproduction fec0 does not need to be conditional on their survival, and vice versa, unless there are biological constraints on the species (e.g. masting, costs of reproduction, etc.)
+
+```{r}
+d1[51:55,]
+```
+
+In preparing data where more than one state variable will be considered, the user must specify which transitions and contributions are made to the continuous stage (changes in maximum stem length) and which ones are made into and out of discrete stages (e.g. seed bank). 
+
+The following code sets the variable stage (maximum height of individuals of Hypericum) as continuous in the IPM. If a given individual has not yet been recruited into the continuous stage (or sampled) its size will be NA, and thus its stage will also be NA. If an individual has not survived (surv = 0), its stageNext will be dead.
+
+```{r}
+d1$stageNext <- d1$stage <- "continuous"
+d1$stage[is.na(d1$size)] <- NA
+d1$stageNext[d1$surv==0] <- "dead"
+head(d1)
+```
+
+Next we specify the number of individuals changing from a specific size at time t to another (or the same) value at time t+1. Because individuals are very unlikely to have the exact same data fro size transitions, we simply assign "1" to the variable number for every row. This variable will come in handy when merging the continuous part of the life cycle with the discrete transitions. 
+
+```{r}
+d1$number <- 1
+head(d1)
+```
+
+Next we specify transitions within and among the continuous and discrete stages - transitions from the continuous stage to the discrete stage, transitions within the discrete stage, and transitions from the discrete stage to the continuous stage. Transitions here are:
+
+* continuous stage -> discrete stage: individuals with a given height in year t contribute seeds to the seed bank, that is, seeds that were produced, did not germinate, and remain viable
+* discrete stage -> discrete stage: prolonged dormancy and survival of seeds in the seed bank.
+* discrete stage -> continuous stage: germination of seeds from thh seed bank to become individuals of a given above ground stem height. 
+
+To accommodate these possible transitions, we create a data frame that will describe these processes. Here is where variable number in d1 comes in handy: there will be hundreds of transitions from the discrete stage to the discrete stage, and it would be rather burdensome to store a row in the data frame for each seed. The variable d1$number will indicate how many individuals are making each type of transition; IPMpack will automatically read those numbers and consider them in the growth and fecundity objects.
+
+```{r}
+seedbank <- data.frame(year="All",size=NA,surv=1,sizeNext=NA,fec0=NA,fec1=NA,
+stage=c("seedbank","seedbank","continuous"),
+stageNext=c("seedbank","continuous","seedbank"),
+number=c(staySB,(1-staySB)*fec3*fec4,1))
+seedbank
+```
+
+The data for continuous and discrete parts of the lifecycle are then concatenated into a single data set. Note that year = "All" for the seed bank dynamics because processes governing these dynamics are assumed to remain constant across years.
+
+```{r}
+d1 <- rbind(d1,seedbank)
+head(d1)
+tail(d1)
+```
+
+The final step before data exploration and analysis is to specify stage and stageNext as factors
+
+```{r}
+d1$stage <- as.factor(d1$stage)
+d1$stageNext <- as.factor(d1$stageNext)
+```
+
+## Analysis
+
+Working first with the 1994-1995 transition
+
+```{r}
+d94 <- subset(d1, d1$year == "1994" | d1$year == "All")
+```
+
+We first make a dummy size axis and define the size range. This size axis will be used to define the mesh points for integration of the IPM kernel, following the midpoint rule.
+
+```{r}
+minSize<-min(d1$size,na.rm=T)
+maxSize<-max(d1$size,na.rm=T)
+x<-seq(from=minSize,to=maxSize,length=1001)
+x0<-data.frame(size=x,size2=x^2,size3=x^3) # for later use
+```
+
+### Survival Kernel
+
+```{r}
+survModelComp(dataf = d94[!is.na(d$size),],
+expVars = c(surv~1, surv~size, surv~size + size2,
+surv~size + size2 + size3),
+makePlot = TRUE, legendPos = "bottomleft", mainTitle = "Survival")
+```
+
+JM version
+
+Need to subset twice to match what they did: 1. d94[!is.na(d$size),], this gets subset again before models are fit 2. subset(dataf, is.na(dataf$surv) == FALSE)
+
+```{r}
+dataf = d94[!is.na(d$size),]
+dataf.2 = subset(dataf, is.na(dataf$surv) == FALSE)
+
+newdata = tibble(size=seq(min(dataf$size, na.rm = TRUE), max(dataf$size, na.rm = TRUE), length.out=101))
+
+
+surv.models <- tibble(name=c("0_intercept", "1_linear", "2_quadratic", "3_cubic"),
+                      f = c("surv ~ 1", 
+                            "surv ~ size", 
+                            "surv ~ size + I(size^2)", 
+                            "surv ~ size + I(size^2) + I(size^3)"))
+
+surv.models <- surv.models %>%
+  mutate(glm = map(f, ~ glm(as.formula(.), data = dataf.2, family = "binomial")),
+         predict = map(glm, ~ cbind(newdata, surv=predict(., newdata, type = "response"))),
+         glance = map(glm, glance))
+```
+
+```{r}
+surv.models %>% unnest(glance)
+```
+
+Plot the predictions
+
+```{r}
+surv.predictions <- surv.models %>% dplyr::select(name, predict) %>% unnest(predict)
+
+  dataf.2 %>%
+  ggplot(aes(x=size, y =surv)) +
+  geom_point() +
+  #geom_smooth() + 
+  geom_line(aes(color=name), data = surv.predictions) +
+  scale_color_viridis_d(end = 0.9)
+```
+
+Choose the quadratic, all give the same values since makeSurvObj is filtering the data.
+
+```{r}
+so94 <- makeSurvObj(d94, surv~size+I(size^2))
+so94
+so.test = makeSurvObj(dataf, surv~size+I(size^2))
+so.test
+so.test.2 = makeSurvObj(dataf.2, surv~size+I(size^2))
+so.test.2
+```
+
+### Growth Kernel
+
+```{r}
+growthModelComp(dataf = d94, expVars = c(sizeNext~1, sizeNext~size,
+sizeNext~size + size2, sizeNext~size + size2 + size3), makePlot = TRUE,
+legendPos = "bottomright", mainTitle = "Growth")
+abline(a = 0, b = 1, lty= 2, col = "gray", lwd=2)
+```
+
+```{r}
+go94 <- makeGrowthObj(d94, sizeNext~size)
+```
+
+JM Version
+
+```{r}
+dataf <- subset(d94, is.na(d94$size) == FALSE)
+
+newdata = tibble(size=seq(min(dataf$size, na.rm = TRUE), max(dataf$size, na.rm = TRUE), length.out=101))
+
+
+growth.models <- tibble(name=c("0_intercept", "1_linear", "2_quadratic", "3_cubic"),
+                      f = c("sizeNext ~ 1", 
+                            "sizeNext ~ size", 
+                            "sizeNext ~ size + I(size^2)", 
+                            "sizeNext ~ size + I(size^2) + I(size^3)"))
+
+growth.models <- growth.models %>%
+  mutate(lm = map(f, ~ lm(as.formula(.), data = dataf)),
+         predict = map(lm, ~ cbind(newdata, sizeNext=predict(., newdata))),
+         glance = map(lm, glance))
+
+growth.models %>% unnest(glance)
+```
+
+```{r}
+growth.predictions <- growth.models %>% dplyr::select(name, predict) %>% unnest(predict)
+
+dataf <- subset(d94, is.na(d94$size) == FALSE)
+
+  dataf %>%
+  ggplot(aes(x=size, y =sizeNext)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, lty = 5, color = "grey") + 
+  geom_line(aes(color=name), data = growth.predictions) +
+  scale_color_viridis_d(end = 0.9)
+```
+
+### Make the P matrix
+
+Build a P matrix, which combines the survival and growth models into a single kernel. In this example, there is no evidence of eviction. Nonetheless, it is a good practice to choose correction = "constant", which prevents 'eviction' below minSize and above maxSize
+
+```{r}
+Pmatrix94 <- makeIPMPmatrix(survObj = so94, growObj = go94,
+                            minSize = minSize, maxSize = maxSize,
+                            nBigMatrix = 80, correction = "constant")
+
+# minSize and maxSize calculated from original entire dataset d1
+# nBigMatrix is the dimensions of the matrix
+```
+
+```{r}
+require(fields)
+image.plot(Pmatrix94@meshpoints,
+Pmatrix94@meshpoints,
+t(Pmatrix94),
+main = "Pmatrix: survival and growth",
+xlab = "Size at t",
+ylab = "Size at t+1")
+abline(a = 0, b = 1, lty= 2, col = "white", lwd=2)
+```
+
+Diagnostics. The close match between the red, black, and blue lines indicates that our model, as currently specified, is robust to accidental individual eviction.
+
+```{r}
+diagnosticsPmatrix(Pmatrix94, growObj = go94, survObj = so94,
+correction = "constant")
+```
+
+JM version
+
+Create dataframe for survival and growth parameters
+
+```{r}
+params=data.frame(
+  surv.int=NA, # Intercept from logistic regression of survival
+  surv.slope1=NA, # Slope from logistic regression of survival
+  surv.slope2=NA, # Quadratic slope from logistic regression of survival
+  growth.int=NA, # Intercept from linear regression of growth
+  growth.slope=NA, # Slope from linear regression of growth
+  growth.sd=NA # Residual sd from the linear regression of growth
+)
+```
+
+Get survival coefficients for quadratic model
+
+```{r}
+coefficients(surv.models$glm[[3]]) # this works but number would change if changing models/order of models
+
+surv.coefs <- surv.models %>% 
+  filter(name == "2_quadratic") %>%
+  mutate(coefs = map(glm, tidy)) %>% 
+  dplyr::select(name, f, coefs) %>% 
+  unnest(coefs) 
+
+params$surv.int <- surv.coefs %>% filter(term == "(Intercept)") %>% pull(estimate)
+params$surv.slope1 <- surv.coefs %>% filter(term == "size") %>% pull(estimate)
+params$surv.slope2 <- surv.coefs %>% filter(term == "I(size^2)") %>% pull(estimate)
+```
+
+Get growth coefficients from linear model
+
+```{r}
+coefficients(growth.models$lm[[2]])
+sd(resid(growth.models$lm[[2]])) # 12.84041
+
+growth.coefs <- growth.models %>% 
+  filter(name == "1_linear") %>%
+  mutate(coefs = map(lm, tidy)) %>% 
+  dplyr::select(name, f, coefs) %>% 
+  unnest(coefs)
+
+params$growth.int <- growth.coefs %>% filter(term=="(Intercept)") %>% pull(estimate)
+params$growth.slope <- growth.coefs %>% filter(term=="size") %>% pull(estimate)
+
+# Julin pulling sigma which is the _modeled_ standard deviation of the residuals.  Merow uses observed.  
+# params$growth.sd <- growth.models %>% filter(name=="1_linear") %>% unnest(glance) %>% pull(sigma) # 12.98229
+
+params$growth.sd = sd(resid(growth.models$lm[[2]]))
+```
+
+Set up the functions
+
+```{r}
+# survival probability function, this is a logistic function, provides survival probability based on size.
+s.x=function(x,params) {
+  u=exp(params$surv.int + params$surv.slope1*x + params$surv.slope2*x^2)
+  return(u/(1+u))  # this is back transforming from logit
+}
+
+# growth function, this is a normal distribution, returns a probability distribution of new sizes at t+1 (xp) at a given size x.  
+g.yx=function(xp,x,params) {
+  dnorm(xp,mean=params$growth.int+params$growth.slope*x,sd=params$growth.sd)
+}
+```
+
+Make the kernel and define the parameters for integration
+
+```{r}
+# the sizes we are integrating over
+min.size=.9*min(c(d94$size, d94$sizeNext),na.rm=T)
+max.size=1.1*max(c(d94$size, d94$sizeNext),na.rm=T)
+
+n=80 # dimensions of the matrix, change to 80 to match nBigMatrix in Merow code, now plots match
+
+b=min.size+c(0:n)*(max.size-min.size)/n # boundary points
+y=0.5*(b[1:n]+b[2:(n+1)]) # mesh points
+h=y[2]-y[1] # step size
+```
+
+Make the matrix
+
+```{r}
+G = h*outer(y,y,g.yx,params = params) # growth matrix
+S = s.x(y, params = params) # survival
+P = G # placeholder, redefine P on the next line
+for(i in 1:n) P[,i] = G[,i]*S[i] # growth/survival matrix
+```
+
+Plot the matrix
+
+```{r}
+P %>% as_tibble() %>%
+  set_colnames(y) %>% 
+  mutate(size.t1=y) %>%
+  pivot_longer(-size.t1, names_to = "size.t", names_transform = as.numeric) %>%
+  ggplot(aes(x=size.t, y = size.t1)) +
+  geom_raster(aes(fill = value)) +
+  geom_contour(aes(z = value),lwd=.25) +
+  geom_abline(intercept=0, slope = 1, color="gray90", lty=5) +
+  scale_fill_viridis_c(option = "plasma") +
+  labs(x = "Size (t)", y = "Size (t + 1)", title = "P Matrix: Size and Growth") +
+  coord_equal() +
+  theme_bw()
+```
+
+### Fecundity Kernel
