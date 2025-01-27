@@ -93,7 +93,7 @@ d1$stageNext[d1$surv==0] <- "dead"
 head(d1)
 ```
 
-Next we specify the number of individuals changing from a specific size at time t to another (or the same) value at time t+1. Because individuals are very unlikely to have the exact same data fro size transitions, we simply assign "1" to the variable number for every row. This variable will come in handy when merging the continuous part of the life cycle with the discrete transitions. 
+Next we specify the number of individuals changing from a specific size at time t to another (or the same) value at time t+1. Because individuals are very unlikely to have the exact same data for size transitions, we simply assign "1" to the variable number for every row. This variable will come in handy when merging the continuous part of the life cycle with the discrete transitions. 
 
 ```{r}
 d1$number <- 1
@@ -357,24 +357,25 @@ g.yx=function(xp,x,params) {
 Make the kernel and define the parameters for integration
 
 ```{r}
-# the sizes we are integrating over
-min.size=.9*min(c(d94$size, d94$sizeNext),na.rm=T)
-max.size=1.1*max(c(d94$size, d94$sizeNext),na.rm=T)
+minSize = minSize
+maxSize = maxSize
+nBigMatrix = 80
 
-n=80 # dimensions of the matrix, change to 80 to match nBigMatrix in Merow code, now plots match
-
-b=min.size+c(0:n)*(max.size-min.size)/n # boundary points
-y=0.5*(b[1:n]+b[2:(n+1)]) # mesh points
-h=y[2]-y[1] # step size
+b <- minSize + c(0:nBigMatrix) * (maxSize - minSize)/nBigMatrix # boundary points
+y <- 0.5 * (b[1:nBigMatrix] + b[2:(nBigMatrix + 1)]) # mesh points
+h <- y[2] - y[1] # step size
 ```
 
 Make the matrix
 
 ```{r}
 G = h*outer(y,y,g.yx,params = params) # growth matrix
+# OK for each value of y,y evaluate the growth function g.yx using params
+# If I understand this correctly, the rows are x(t) and the columns are x(t+1)
+
 S = s.x(y, params = params) # survival
 P = G # placeholder, redefine P on the next line
-for(i in 1:n) P[,i] = G[,i]*S[i] # growth/survival matrix
+for(i in 1:nBigMatrix) P[,i] = G[,i]*S[i] # growth/survival matrix
 ```
 
 Plot the matrix, before constant correct.
@@ -579,6 +580,7 @@ row.names=c("fec0","fec1",
 "fec2","fec3","fec4")))
 ```
 
+
 Create the F kernel based on the fecundity object
 
 ```{r}
@@ -596,5 +598,97 @@ t(Fmatrix94[2:maxSize,2:maxSize]),
 main = "Fmatrix: fecundity",
 xlab = "Size at t",
 ylab = "Size at t+1")
+```
+
+
+
+
+
+JM fecundity kernels together
+
+```{r}
+fec1.coefs <- fec1.models %>% 
+  filter(name == "3_cubic") %>%
+  mutate(coefs = map(glm, tidy)) %>% 
+  dplyr::select(name, f, coefs) %>% 
+  unnest(coefs) 
+
+params$fec1.int <- fec1.coefs %>% filter(term=="(Intercept)") %>%
+  pull(estimate)
+params$fec1.slope1 <- fec1.coefs %>% filter(term=="size") %>%
+  pull(estimate)
+params$fec1.slope2 <- fec1.coefs %>% filter(term=="I(size^2)") %>%
+  pull(estimate)
+params$fec1.slope3 <- fec1.coefs %>% filter(term=="I(size^3)") %>%
+  pull(estimate)
+params
+
+fruit.n <- function(x, params) {
+  exp(params$fec1.int + 
+        x*params$fec1.slope1 + 
+        x^2*params$fec1.slope2 + 
+        x^3*params$fec1.slope3)
+}
+
+# reality check (compare to plot...looks good)
+fruit.n(40, params)
+fruit.n(60, params)
+fruit.n(80, params)
+
+
+f.yx=function(xp,x,params) {
+  # For seed produced this cycle and not going in to the seed bank
+  # flowering probability
+  predict(fec0.models$glm[[3]], data.frame(size=x), type="response") * 
+    # fruit production
+    fruit.n(x, params) *
+    # number of seed per fruit 
+    fec2 *
+    # probability of seed not going to seed bank
+    (1-goSB) *
+    # probability of germination (is this not related to seed bank??)
+    fec3 *
+    # probability of seedling survival
+    fec4 *
+    # distribution of new sizes
+    dnorm(xp,mean=params$recruit.size.mean,sd=params$recruit.size.sd)  # + 
+  
+  # note that the code below is commented out because it is not included in makeIPMFmatrix function
+  # So to get my numbers to match this has to be removed
+    
+    # # For seed produced this cycle and then entering and exiting the seed bank
+    # # For seed produced this cycle
+    # # flowering probability
+    # predict(fec0.models$glm[[3]], data.frame(size=x), type="response") * 
+    # # fruit production
+    # fruit.n(x, params) *
+    # # number of seed per fruit 
+    # fec2 *
+    # # probability of seed germinating at this time
+    # goSB * (1-staySB) *
+    # # probability of germination (is this not related to seed bank??)
+    # fec3 *
+    # # probability of seedling survival
+    # fec4 *
+    # # distribution of new sizes
+    # dnorm(xp,mean=params$recruit.size.mean,sd=params$recruit.size.sd)
+}
+```
+
+
+JM version of create the F kernel based on the fecundity object
+
+```{r}
+minSize = minSize
+maxSize = maxSize
+nBigMatrix = 80
+
+b <- minSize + c(0:nBigMatrix) * (maxSize - minSize)/nBigMatrix
+y <- 0.5 * (b[1:nBigMatrix] + b[2:(nBigMatrix + 1)])
+h <- y[2] - y[1]
+  
+toContinuousF=h*outer(y,y,f.yx,params=params) # reproduction matrix for seed that germinate in this cycle
+```
+
 ```
 
