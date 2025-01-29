@@ -1,0 +1,329 @@
+---
+title: "Real.Data"
+output: html_document
+date: "2025-01-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(lme4)
+library(broom.mixed)
+library(magrittr)
+```
+
+Read in the growth and survival data
+
+```{r}
+growth = read.csv("../Data/WL2-2023_Size_Combined.csv")
+surv = read.csv("../Data/WL2_Mortality.csv")
+```
+
+Columns we need in the final data frame for analysis: size, sizeNext, surv (0,1), fec.seed (number of seeds), fec.flower (flowering status,0,1). If suv = 0, then sizeNext is NA.
+
+```{r}
+head(growth)
+head(surv)
+```
+
+Work with growth first. Going to use start date as 2023-07-26 and end date as 2023-10-20 since both have 1577. Slim data to those dates. This removes some genotypes where first height was measured on a different day.
+
+```{r}
+growth.2 = growth %>%
+  filter(survey_date %in% c("2023-07-26","2023-10-20"))
+```
+
+All genotypes should have two values, but some have 3 or 4. Looks like some issues with planting.
+
+```{r}
+range(table(growth.2$Genotype))
+tail(sort(table(growth.2$Genotype)))
+```
+
+Need to remove these odd rows. Not sure how to automate this removal
+
+```{r}
+growth.3 = growth.2[-c(1114,1561,3138,1015,2123,172,1862,1017,2125),]
+range(table(growth.3$Genotype))
+```
+
+Remove genotypes where both dates have a height of NA, first height may have been measured on a different date
+
+```{r}
+growth.4 = growth.3 %>%
+  group_by(Genotype) %>%
+  filter(any(!is.na(height.cm)))
+```
+
+Make sure it worked
+
+```{r}
+range(table(growth.4$Genotype))
+```
+
+Need to make the dataframe into wide format. Remove longest leaf and survey notes so data merges better. Checked to see that we do have 1075 unique genotypes which is now the number of rows in growth.6
+
+```{r}
+growth.5 = growth.4 %>%
+  select(-long.leaf.cm, -survey.notes)
+growth.6 = growth.5 %>%
+  pivot_wider(., names_from = survey_date, values_from = height.cm)
+```
+
+Remove the 1 row with first survey data as NA
+
+```{r}
+growth.7 = growth.6 %>%
+  filter(!is.na(`2023-07-26`))
+```
+
+Make a new column for surv
+
+```{r}
+growth.7$surv = ifelse(is.na(growth.7$`2023-10-20`), 0, 1)
+```
+
+Change column names to match practice code
+
+```{r}
+colnames(growth.7)[7] = "size"
+colnames(growth.7)[8] = "sizeNext"
+```
+
+### Plotting
+
+Plotting survival, growth/shrinkage/stasis as a function of our state variable, size.
+
+```{r}
+survival.plot=ggplot(growth.7, aes(x = size, y = surv))+
+  geom_point()+
+  xlab("Size (t)")+
+  ylab("Survival to t+1")
+survival.plot
+sizenext.plot=ggplot(growth.7, aes(x = size, y = sizeNext))+
+  geom_point()+
+  xlab("Size (t)")+
+  ylab("Size to t+1")
+sizenext.plot
+```
+
+Make the nesting of pop.mf within parent.pop explicit in the data
+
+```{r}
+growth.6$pop.mf.2 = interaction(growth.6$parent.pop, growth.6$pop.mf, drop = TRUE)
+```
+
+
+### Survival Kernel
+
+```{r}
+
+#newdata <- expand_grid(
+  #parent.pop = unique(growth.6$parent.pop),
+  #pop.mf.2 = unique(growth.6$pop.mf.2),
+  #block = unique(growth.6$block),
+  #size = seq(min(growth.6$size, na.rm = TRUE), max(growth.6$size, na.rm = TRUE), length.out = 100))
+
+surv.models <- tibble(name=c("0_intercept", "1_linear", "2_quadratic", "3_cubic"),
+                      f = c("surv ~ 1 + (1|block) + (1|parent.pop/pop.mf)", 
+                            "surv ~ size + (1|block) + (1|parent.pop/pop.mf)", 
+                            "surv ~ size + I(size^2) + (1|block) + (1|parent.pop/pop.mf)", 
+                            "surv ~ size + I(size^2) + I(size^3) + (1|block) + (1|parent.pop/pop.mf)"))
+
+surv.models <- surv.models %>%
+  mutate(glmer = map(f, ~ glmer(as.formula(.), data = growth.7, family = "binomial")),
+         predict = map(glmer, ~ cbind(growth.7, preds=predict(., type = "response"))),
+         glance = map(glmer, tidy),
+         AIC = map(glmer, AIC))
+```
+
+Quadratic best fit according to AIC
+
+```{r}
+surv.models %>% unnest(AIC)
+```
+
+```{r}
+survival.model.final = surv.models %>% filter(name == "3_cubic") %>% pull(glmer) %>% magrittr::extract2(1)
+summary(survival.model.final)
+```
+
+
+Plot the predictions for the cubic model.
+
+```{r}
+surv.predictions <- surv.models %>% dplyr::select(name, predict) %>% unnest(predict)
+
+ggplot(surv.predictions, aes(x = size, y = surv)) +
+  geom_point()+
+  geom_smooth(aes(y = preds, color = name))+
+  scale_color_viridis_d(end = 0.9)
+```
+
+
+### Growth Kernel
+
+```{r}
+#newdata <- expand_grid(
+  #parent.pop = unique(growth.6$parent.pop),
+  #pop.mf.2 = unique(growth.6$pop.mf.2),
+  #block = unique(growth.6$block),
+  #size = seq(min(growth.6$size, na.rm = TRUE), max(growth.6$size, na.rm = TRUE), length.out = 100))
+
+growth.8 = growth.7 %>%
+  filter(!is.na(sizeNext))
+
+growth.models <- tibble(name=c("0_intercept", "1_linear", "2_quadratic", "3_cubic"),
+                      f = c("sizeNext ~ 1 + (1|block) + (1|parent.pop/pop.mf)", 
+                            "sizeNext ~ size + (1|block) + (1|parent.pop/pop.mf)", 
+                            "sizeNext ~ size + I(size^2) + (1|block) + (1|parent.pop/pop.mf)", 
+                            "sizeNext ~ size + I(size^2) + I(size^3) + (1|block) + (1|parent.pop/pop.mf)"))
+
+growth.models <- growth.models %>%
+  mutate(lmer = map(f, ~ lmer(as.formula(.), data = growth.8)),
+         predict = map(lmer, ~ cbind(growth.8, preds=predict(.))),
+         glance = map(lmer, tidy),
+         AIC = map(lmer, AIC))
+
+```
+
+Linear best fit according to AIC
+
+```{r}
+growth.models %>% unnest(AIC)
+```
+
+```{r}
+growth.model.final = growth.models %>% filter(name == "1_linear") %>% pull(lmer) %>% magrittr::extract2(1)
+summary(growth.model.final)
+```
+
+Plot the predictions for the linear model.
+
+```{r}
+growth.predictions <- growth.models %>% dplyr::select(name, predict) %>% unnest(predict)
+
+ggplot(growth.predictions, aes(x = size, y = sizeNext)) +
+  geom_point()+
+  geom_smooth(aes(y = preds, color = name))+
+  scale_color_viridis_d(end = 0.9)
+```
+
+### Creating the P matrix
+
+Create dataframe for survival and growth parameters
+
+```{r}
+params=data.frame(
+  surv.int=NA, # Intercept from logistic regression of survival
+  surv.slope1=NA, # Slope from logistic regression of survival
+  surv.slope2=NA, # Quadratic slope from logistic regression of survival
+  surv.slope3=NA, # Cubic slope from logistic regression of survival
+  growth.int=NA, # Intercept from linear regression of growth
+  growth.slope=NA, # Slope from linear regression of growth
+  growth.sd=NA # Residual sd from the linear regression of growth
+)
+```
+
+Get survival coefficients for cubic model
+
+```{r}
+surv.coefs <- surv.models %>% 
+  filter(name == "3_cubic") %>%
+  mutate(coefs = map(glmer, tidy)) %>% 
+  dplyr::select(name, f, coefs) %>% 
+  unnest(coefs) 
+
+params$surv.int <- surv.coefs %>% filter(term == "(Intercept)") %>% pull(estimate)
+params$surv.slope1 <- surv.coefs %>% filter(term == "size") %>% pull(estimate)
+params$surv.slope2 <- surv.coefs %>% filter(term == "I(size^2)") %>% pull(estimate)
+params$surv.slope3 <- surv.coefs %>% filter(term == "I(size^3)") %>% pull(estimate)
+```
+
+Get growth coefficients from linear model
+
+```{r}
+growth.coefs <- growth.models %>% 
+  filter(name == "1_linear") %>%
+  mutate(coefs = map(lmer, tidy)) %>% 
+  dplyr::select(name, f, coefs) %>% 
+  unnest(coefs)
+
+params$growth.int <- growth.coefs %>% filter(term=="(Intercept)") %>% pull(estimate)
+params$growth.slope <- growth.coefs %>% filter(term=="size") %>% pull(estimate)
+params$growth.sd = sd(resid(growth.models$lmer[[2]])) # observed standard deviation
+```
+
+Set up the functions
+
+```{r}
+# survival probability function, this is a logistic function, provides survival probability based on size.
+s.x=function(x,params) {
+  u=exp(params$surv.int + params$surv.slope1*x + params$surv.slope2*x^2 + params$surv.slope3*x^3)
+  return(u/(1+u))  # this is back transforming from logit
+}
+
+# growth function, this is a normal distribution, returns a probability distribution of new sizes at t+1 (xp) at a given size x.  
+g.yx=function(xp,x,params) {
+  dnorm(xp,mean=params$growth.int+params$growth.slope*x,sd=params$growth.sd)
+}
+```
+
+Make the kernel and define the parameters for integration
+
+```{r}
+minSize<-min(growth.7$size,na.rm=T)
+maxSize<-max(growth.7$size,na.rm=T)
+nBigMatrix = 80
+
+b <- minSize + c(0:nBigMatrix) * (maxSize - minSize)/nBigMatrix # boundary points
+y <- 0.5 * (b[1:nBigMatrix] + b[2:(nBigMatrix + 1)]) # mesh points
+h <- y[2] - y[1] # step size
+```
+
+Make the matrix
+
+```{r}
+G = h*outer(y,y,g.yx,params = params) # growth matrix
+# OK for each value of y,y evaluate the growth function g.yx using params
+# If I understand this correctly, the rows are x(t) and the columns are x(t+1)
+
+S = s.x(y, params = params) # survival
+P = G # placeholder, redefine P on the next line
+for(i in 1:nBigMatrix) P[,i] = G[,i]*S[i] # growth/survival matrix
+```
+
+Correct the matrix using the Merow et al "constant" correction code
+
+```{r}
+Pc = P # making a corrected matrix from already generated matrix
+nvals <- colSums(Pc, na.rm = TRUE)
+loc0 <- which(nvals == 0, arr.ind = TRUE)
+if (length(loc0) > 0) {
+      print("warnings - columns that sum to 0 or that have NAs - assuming survival is along the diagonal; plot your Pmatrix to check it")
+      Pc[, loc0] <- 0
+      Pc[cbind(loc0, loc0)] <- s.x(size = y[loc0], params = params)
+}
+nvals <- colSums(Pc, na.rm = TRUE)
+Pc <- t((t(Pc)/nvals) * s.x(y, params=params))
+```
+
+Plot the corrected matrix
+
+```{r}
+Pc %>% as_tibble() %>%
+  set_colnames(y) %>% 
+  mutate(size.t1=y) %>%
+  pivot_longer(-size.t1, names_to = "size.t", names_transform = as.numeric) %>%
+  ggplot(aes(x=size.t, y = size.t1)) +
+  geom_raster(aes(fill = value)) +
+  geom_contour(aes(z = value),lwd=.25) +
+  geom_abline(intercept=0, slope = 1, color="gray90", lty=5) +
+  scale_fill_viridis_c(option = "plasma") +
+  labs(x = "Size (t)", y = "Size (t + 1)", title = "P Matrix (corrected): Size and Growth") +
+  coord_equal() +
+  theme_bw()
+```
