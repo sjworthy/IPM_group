@@ -18,8 +18,8 @@ library(magrittr)
 Read in the growth and survival data
 
 ```{r}
-growth = read.csv("../Data/WL2-2023_Size_Combined.csv")
-surv = read.csv("../Data/WL2_Mortality.csv")
+growth = read_csv("../Data/WL2-2023_Size_Combined.csv")
+surv = read_csv("../Data/WL2_Mortality_2023.csv")
 ```
 
 Columns we need in the final data frame for analysis: size, sizeNext, surv (0,1), fec.seed (number of seeds), fec.flower (flowering status,0,1). If suv = 0, then sizeNext is NA.
@@ -29,91 +29,137 @@ head(growth)
 head(surv)
 ```
 
-Work with growth first. Going to use start date as 2023-07-26 and end date as 2023-10-20 since both have 1577. Slim data to those dates. This removes some genotypes where first height was measured on a different day.
+Correcting duplication in growth
 
 ```{r}
 growth.2 = growth %>%
-  filter(survey_date %in% c("2023-07-26","2023-10-20"))
+  arrange(Genotype, survey_date, height.cm) %>%
+  distinct(Genotype, survey_date, .keep_all = TRUE)
 ```
 
-All genotypes should have two values, but some have 3 or 4. Looks like some issues with planting.
+Change column names to match common IPM terminology
 
 ```{r}
-range(table(growth.2$Genotype))
-tail(sort(table(growth.2$Genotype)))
+colnames(growth.2)[8] = "size"
 ```
 
-Need to remove these odd rows. Not sure how to automate this removal
+Wrangle growth data using Julin's code
 
 ```{r}
-growth.3 = growth.2[-c(1114,1561,3138,1015,2123,172,1862,1017,2125),]
-range(table(growth.3$Genotype))
+growth.3 <- growth.2 %>% 
+  arrange(Genotype, survey_date) %>%
+  select(-survey.notes, -long.leaf.cm) %>%
+  group_by(Genotype) %>%
+  mutate(sizeNext = lead(size),
+         elapsed_days= lead(survey_date) - survey_date, # works b/c of read_csv, reads in survey_date as Date
+         elapsed_weeks = as.integer(elapsed_days)/7,
+         survey_date_char = as.character(survey_date)) %>%
+  ungroup() %>%
+  drop_na(size, sizeNext)
+
+growth.3 
 ```
 
-Remove genotypes where both dates have a height of NA, first height may have been measured on a different date
+Merge survival and growth data. Remove block from growth first.
 
 ```{r}
 growth.4 = growth.3 %>%
-  group_by(Genotype) %>%
-  filter(any(!is.na(height.cm)))
+  select(Genotype,parent.pop,mf,rep,size,sizeNext,elapsed_weeks,survey_date_char)%>%
+  rename(pop = parent.pop)
 ```
-
-Make sure it worked
 
 ```{r}
-range(table(growth.4$Genotype))
+all.data = merge(growth.4,surv)
 ```
 
-Need to make the dataframe into wide format. Remove longest leaf and survey notes so data merges better. Checked to see that we do have 1075 unique genotypes which is now the number of rows in growth.6
-
-```{r}
-growth.5 = growth.4 %>%
-  select(-long.leaf.cm, -survey.notes)
-growth.6 = growth.5 %>%
-  pivot_wider(., names_from = survey_date, values_from = height.cm)
-```
-
-Remove the 1 row with first survey data as NA
-
-```{r}
-growth.7 = growth.6 %>%
-  filter(!is.na(`2023-07-26`))
-```
-
-Make a new column for surv
-
-```{r}
-growth.7$surv = ifelse(is.na(growth.7$`2023-10-20`), 0, 1)
-```
-
-Change column names to match practice code
-
-```{r}
-colnames(growth.7)[7] = "size"
-colnames(growth.7)[8] = "sizeNext"
-```
 
 ### Plotting
 
 Plotting survival, growth/shrinkage/stasis as a function of our state variable, size.
 
 ```{r}
-survival.plot=ggplot(growth.7, aes(x = size, y = surv))+
-  geom_point()+
-  xlab("Size (t)")+
-  ylab("Survival to t+1")
-survival.plot
-sizenext.plot=ggplot(growth.7, aes(x = size, y = sizeNext))+
+sizenext.plot=ggplot(growth.4, aes(x = size, y = sizeNext))+
   geom_point()+
   xlab("Size (t)")+
   ylab("Size to t+1")
 sizenext.plot
 ```
 
-Make the nesting of pop.mf within parent.pop explicit in the data
+```{r}
+sizenext.pop.plot=ggplot(growth.4, aes(x = size, y = sizeNext))+
+  geom_point()+
+  xlab("Size (t)")+
+  ylab("Size to t+1")+
+  facet_wrap(~pop)
+sizenext.pop.plot
+```
+
+### Growth Kernel
+
+Never finished running
+```{r}
+
+growth.models <- tibble(name=c("0_intercept", "1_linear", "2_linear_weeks","3_linear_date","4_quadratic", "5_quadratic_weeks",
+                               "6_quadratic_date","7_cubic","8_cubic_weeks","9_cubic_date"),
+                      f = c("sizeNext ~ 1 + (1|block) + (1|pop)", 
+                            "sizeNext ~ size + (1|block) + (1+size|pop)", 
+                            "sizeNext ~ size*elapsed_weeks + (1|block) + (1+size*elapsed_weeks|pop)", 
+                            "sizeNext ~ size*survey_date_char + (1|block) + (1+size*survey_date_char|pop)", 
+                             "sizeNext ~ size + I(size^2) + (1|block) + (1+size + I(size^2)|pop)", 
+                            "sizeNext ~ size*elapsed_weeks + I(size^2)*elapsed_weeks + (1|block) + (1+size*elapsed_weeks + I(size^2)*elapsed_weeks|pop)", 
+                            "sizeNext ~ size*survey_date_char + I(size^2)*survey_date_char + (1|block) + (1+size*survey_date_char + I(size^2)*survey_date_char|pop)",
+                            "sizeNext ~ size + I(size^2) + I(size^3) + (1|block) + (1|pop)",
+                            "sizeNext ~ size*elapsed_weeks + I(size^2)*elapsed_weeks + I(size^3)*elapsed_weeks + (1|block) + (1+size*elapsed_weeks + I(size^2)*elapsed_weeks + I(size^3)*elapsed_weeks|pop)",
+                            "sizeNext ~ size*survey_date_char + I(size^2)*survey_date_char + I(size^3)*survey_date_char + (1|block) + (1+size*survey_date_char + I(size^2)*survey_date_char + I(size^3)*survey_date_char|pop)"))
+
+growth.models.2 <- growth.models %>%
+  mutate(lmer = map(f, ~ lmer(as.formula(.), data = all.data)),
+         predict = map(lmer, ~ cbind(all.data, preds=predict(.))),
+         glance = map(lmer, broom.mixed::glance))
+
+```
 
 ```{r}
-growth.6$pop.mf.2 = interaction(growth.6$parent.pop, growth.6$pop.mf, drop = TRUE)
+
+growth.models <- tibble(name=c("0_intercept", "1_linear", "2_linear_weeks","4_quadratic", "5_quadratic_weeks",
+                               "7_cubic","8_cubic_weeks"),
+                      f = c("sizeNext ~ 1 + (1|block) + (1|pop)", 
+                            "sizeNext ~ size + (1|block) + (1+size|pop)", 
+                            "sizeNext ~ size*elapsed_weeks + (1|block) + (1+size*elapsed_weeks|pop)", 
+                             "sizeNext ~ size + I(size^2) + (1|block) + (1+size + I(size^2)|pop)", 
+                            "sizeNext ~ size*elapsed_weeks + I(size^2)*elapsed_weeks + (1|block) + (1+size*elapsed_weeks + I(size^2)*elapsed_weeks|pop)", 
+                            "sizeNext ~ size + I(size^2) + I(size^3) + (1|block) + (1|pop)",
+                            "sizeNext ~ size*elapsed_weeks + I(size^2)*elapsed_weeks + I(size^3)*elapsed_weeks + (1|block) + (1+size*elapsed_weeks + I(size^2)*elapsed_weeks + I(size^3)*elapsed_weeks|pop)"))
+
+growth.models.2 <- growth.models %>%
+  mutate(lmer = map(f, ~ lmer(as.formula(.), data = all.data)),
+         predict = map(lmer, ~ cbind(all.data, preds=predict(.))),
+         glance = map(lmer, broom.mixed::glance))
+
+```
+
+
+
+Linear best fit according to AIC
+
+```{r}
+growth.models %>% unnest(glance)
+```
+
+```{r}
+growth.model.final = growth.models %>% filter(name == "1_linear") %>% pull(lmer) %>% magrittr::extract2(1)
+summary(growth.model.final)
+```
+
+Plot the predictions for the linear model.
+
+```{r}
+growth.predictions <- growth.models %>% dplyr::select(name, predict) %>% unnest(predict)
+
+ggplot(growth.predictions, aes(x = size, y = sizeNext)) +
+  geom_point()+
+  geom_smooth(aes(y = preds, color = name))+
+  scale_color_viridis_d(end = 0.9)
 ```
 
 
@@ -164,53 +210,6 @@ ggplot(surv.predictions, aes(x = size, y = surv)) +
 ```
 
 
-### Growth Kernel
-
-```{r}
-#newdata <- expand_grid(
-  #parent.pop = unique(growth.6$parent.pop),
-  #pop.mf.2 = unique(growth.6$pop.mf.2),
-  #block = unique(growth.6$block),
-  #size = seq(min(growth.6$size, na.rm = TRUE), max(growth.6$size, na.rm = TRUE), length.out = 100))
-
-growth.8 = growth.7 %>%
-  filter(!is.na(sizeNext))
-
-growth.models <- tibble(name=c("0_intercept", "1_linear", "2_quadratic", "3_cubic"),
-                      f = c("sizeNext ~ 1 + (1|block) + (1|parent.pop/pop.mf)", 
-                            "sizeNext ~ size + (1|block) + (1|parent.pop/pop.mf)", 
-                            "sizeNext ~ size + I(size^2) + (1|block) + (1|parent.pop/pop.mf)", 
-                            "sizeNext ~ size + I(size^2) + I(size^3) + (1|block) + (1|parent.pop/pop.mf)"))
-
-growth.models <- growth.models %>%
-  mutate(lmer = map(f, ~ lmer(as.formula(.), data = growth.8)),
-         predict = map(lmer, ~ cbind(growth.8, preds=predict(.))),
-         glance = map(lmer, tidy),
-         AIC = map(lmer, AIC))
-
-```
-
-Linear best fit according to AIC
-
-```{r}
-growth.models %>% unnest(AIC)
-```
-
-```{r}
-growth.model.final = growth.models %>% filter(name == "1_linear") %>% pull(lmer) %>% magrittr::extract2(1)
-summary(growth.model.final)
-```
-
-Plot the predictions for the linear model.
-
-```{r}
-growth.predictions <- growth.models %>% dplyr::select(name, predict) %>% unnest(predict)
-
-ggplot(growth.predictions, aes(x = size, y = sizeNext)) +
-  geom_point()+
-  geom_smooth(aes(y = preds, color = name))+
-  scale_color_viridis_d(end = 0.9)
-```
 
 ### Creating the P matrix
 

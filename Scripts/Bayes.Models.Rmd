@@ -1,0 +1,378 @@
+---
+title: "Bayes.Models"
+output: html_document
+date: "2025-04-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+load libraries
+
+```{r}
+library(tidyverse)
+library(brms)
+library(corrplot)
+```
+
+### Loading and correcting data with Brandie's code: https://github.com/BrandieQC/IPM_Practice/blob/main/IntBio_WL2_2023_Climate.Rmd
+
+```{r}
+growth <- read_csv("../Data/WL2-2023_Size_Combined.csv") %>% 
+  select(survey_date, Genotype, parent.pop, height.cm, long.leaf.cm)
+
+unique(growth$parent.pop) #all 23 pops!
+
+surv <- read_csv("../Data/WL2_Mortality_2023.csv") %>% 
+  select(block, BedLoc, Genotype, parent.pop=pop, mf:death.date) %>% 
+  mutate(parent.pop= str_replace(parent.pop, "Y08", "YO8")) %>% 
+  mutate(parent.pop= str_replace(parent.pop, "Y04", "YO4")) %>% 
+  mutate(Genotype= str_replace(Genotype, "Y08", "YO8")) %>% 
+  mutate(Genotype= str_replace(Genotype, "Y04", "YO4")) 
+
+unique(surv$parent.pop) #all 23 pops!
+```
+
+Change height column name to match common IPM terminology
+
+```{r}
+colnames(growth)[4] = "size"
+```
+
+GET RID OF DUPLICATES:
+
+```{r}
+growth.2 <- growth %>% 
+  arrange(Genotype, survey_date, size) %>% 
+  distinct(Genotype, survey_date, .keep_all=TRUE)
+```
+
+Merge with corrections 
+
+```{r}
+all.data <- left_join(growth.2, surv) %>%
+  select(survey_date:parent.pop, mf:rep, block:BedLoc, size, long.leaf.cm, death.date) %>% 
+  drop_na(block) #get rid of plants that were not planted and never got a block assigned. 
+
+tail(all.data, 10)
+unique(all.data$death.date)
+```
+
+Add in surv and sizenext columns
+
+```{r}
+all.data.timeprep <- all.data %>% 
+  select(-long.leaf.cm) %>% 
+  mutate(death.date=mdy(death.date)) %>% 
+  group_by(Genotype) %>% 
+  mutate(sizeNext = lead(size, order_by = survey_date), # next timepoints height
+        # survey_date_char = as.character(survey_date), #grouping variable to compare to continuous survey date 
+         date_next = lead(survey_date, order_by = survey_date), #needed for surv code and interval calc
+         elapsed_days= date_next - survey_date, #interval length in days
+         elapsed_weeks = as.integer(elapsed_days)/7, #interval length in weeks 
+         surv=if_else(is.na(death.date), 1,
+                      if_else(date_next>=death.date, 0, 1))) %>% #survival to the next size time point
+  ungroup() %>%
+  mutate(week = as.numeric(survey_date - ymd("2023-07-03")), #Weeks since pre-transplant size 
+         pop.mf=str_c(parent.pop, "_", mf)) %>% #for specifying random effects separately  
+  drop_na(size, sizeNext, surv) #for models
+```
+
+### Plotting
+
+Plotting survival, growth/shrinkage/stasis as a function of our state variable, size.
+
+```{r}
+sizenext.plot=ggplot(all.data.timeprep, aes(x = size, y = sizeNext))+
+  geom_point()+
+  xlab("Size (t)")+
+  ylab("Size to t+1")
+sizenext.plot
+```
+
+```{r}
+sizenext.pop.plot=ggplot(all.data.timeprep, aes(x = size, y = sizeNext))+
+  geom_point()+
+  xlab("Size (t)")+
+  ylab("Size to t+1")+
+  facet_wrap(~parent.pop)
+sizenext.pop.plot
+```
+
+```{r}
+all.data.timeprep %>%  #pretty skewed
+  ggplot(aes(x=size)) +
+  geom_histogram()
+```
+
+```{r}
+all.data.timeprep %>%  #pretty skewed
+  ggplot(aes(x=sizeNext)) +
+  geom_histogram()
+```
+
+### Log Transformation
+
+Log transform size and sizeNext
+
+```{r}
+all.data.timeprep = all.data.timeprep %>%
+  mutate(size.log = log(size),
+         sizeNext.log = log(sizeNext))
+```
+
+```{r}
+all.data.timeprep %>%  #pretty skewed
+  ggplot(aes(x=size.log)) +
+  geom_histogram()
+```
+
+```{r}
+all.data.timeprep %>%  #pretty skewed
+  ggplot(aes(x=sizeNext.log)) +
+  geom_histogram()
+```
+
+### Add in weekly climate data
+
+Soil Water Content: Soil moisture
+
+```{r}
+swc_raw <- read_csv("../Data/WL2_2023_Bed_C_Soil_Moisture_Corrected.csv") %>% 
+  mutate(Date_Time=mdy_hm(Date_Time))
+head(swc_raw)
+
+swc_port_avgs <- swc_raw %>% #avg across the probes (all in same bed)
+  rowwise() %>% #for each row...
+  mutate(SWC_port_avg = mean(c_across(-Date_Time))) %>%  #avg across all columns except Date_Time
+  select(Date_Time, SWC_port_avg) %>%
+  mutate(Date=as.Date(Date_Time)) 
+
+swc_daily_summary <- swc_port_avgs %>%
+  group_by(Date) %>%
+  summarize(
+    Daily_AvgSWC = mean(SWC_port_avg),
+    Daily_MaxSWC = max(SWC_port_avg),
+    Daily_MinSWC = min(SWC_port_avg))
+head(swc_daily_summary)
+summary(swc_daily_summary)
+```
+
+Soil Temperature
+
+```{r}
+soil_temp_raw <- read_csv("../Data/WL2_2022_2023_iButton_Data_Corrected.csv") %>% 
+  mutate(Date_Time=mdy_hm(Date_Time))
+head(soil_temp_raw)
+
+unique(soil_temp_raw$Bed) #probes not spread out enough to assign half of the field to one probe and the other half to another...
+#A_2 kind of captures the variance and the trends of the other probes 
+
+soil_temp_bedA <- soil_temp_raw %>% 
+  filter(Bed=="A_2") %>% 
+  separate(Date_Time, into = c("Date", "Time"), sep = " ") %>% 
+   mutate(Date=as.Date(Date)) %>% 
+  select(Bed:Time, SoilTemp)
+
+soil_temp_daily_summary <- soil_temp_bedA %>% 
+  group_by(Date) %>%
+  summarize(
+    Daily_AvgTemp = mean(SoilTemp),
+    Daily_MaxTemp = max(SoilTemp),
+    Daily_MinTemp = min(SoilTemp),
+    Diurnal_Range = Daily_MaxTemp-Daily_MinTemp)
+head(soil_temp_daily_summary)
+summary(soil_temp_daily_summary)
+```
+
+### Correlation between SWC and soil temp
+
+```{r}
+daily_temp_swc <- full_join(swc_daily_summary, soil_temp_daily_summary) %>% 
+  drop_na() #drop NAs - note you lose some dates for both temp and swc 
+summary(daily_temp_swc)
+
+temp_swc_scaled <- daily_temp_swc %>% select(Daily_AvgSWC:Diurnal_Range) %>% scale() #normalize the data so they're all on the same scale
+#head(temp_swc_scaled)
+cor.norm_tempswc = cor(temp_swc_scaled) #test correlations among the traits
+cor.sig_tempswc <- cor.mtest(temp_swc_scaled, method="pearson") #test significance of corrs
+corrplot(cor.norm_tempswc, type = "upper",
+         tl.srt = 45, p.mat = cor.sig_tempswc$p, 
+         sig.level = 0.05, insig="blank") # a lot of significant correlations! --> keep separate 
+
+cor.norm_tempswc
+#use only daily AVG SWC b/c highly correlated to max and min swc (r > 0.96)
+#avg and max temp highly correlated (r=0.93)
+#max temp and diurnal range highly correlated (r=0.95) --> don't use max temp 
+```
+
+Brandie had SWC and temp. in separate models. I'm going to try Daily_AvgSWC and Daily_MinTemp b/c r = -0.38
+
+### Merge with size/surv data 
+
+```{r}
+date_intervals <- all.data %>% 
+  select(survey_date) %>% 
+  distinct() %>% 
+  mutate(prev_date = lag(survey_date, order_by = survey_date)) 
+```
+
+```{r}
+swc_intervals <- swc_daily_summary %>% 
+  mutate(Interval=if_else(Date>="2023-07-26" & Date<"2023-08-02", 1,
+                                if_else(Date>="2023-08-02" & Date<"2023-08-16", 2,
+                                if_else(Date>="2023-08-16" & Date<"2023-08-23", 3,
+                                if_else(Date>="2023-08-23" & Date<"2023-08-30", 4,
+                                if_else(Date>="2023-08-30" & Date<"2023-09-06", 5,
+                                if_else(Date>="2023-09-06" & Date<"2023-09-13", 6,
+                                if_else(Date>="2023-09-13" & Date<"2023-09-20", 7,
+                                if_else(Date>="2023-09-20" & Date<"2023-09-27", 8,
+                                if_else(Date>="2023-09-27" & Date<"2023-10-13", 9,
+                                if_else(Date>="2023-10-13" & Date<"2023-10-20", 10, NA))))))))))) %>% 
+  select(Date:Daily_AvgSWC, Interval) %>% 
+  group_by(Interval) %>% 
+  filter(!is.na(Interval)) %>% 
+  summarise(meanSWC=mean(Daily_AvgSWC, na.rm=TRUE))
+```
+
+```{r}
+soil_temp_intervals <- soil_temp_daily_summary %>% 
+  mutate(Interval=if_else(Date>="2023-07-26" & Date<"2023-08-02", 1,
+                                                    if_else(Date>="2023-08-02" & Date<"2023-08-16", 2,
+                                                    if_else(Date>="2023-08-16" & Date<"2023-08-23", 3,
+                                                    if_else(Date>="2023-08-23" & Date<"2023-08-30", 4,
+                                                    if_else(Date>="2023-08-30" & Date<"2023-09-06", 5,
+                                                    if_else(Date>="2023-09-06" & Date<"2023-09-13", 6,
+                                                    if_else(Date>="2023-09-13" & Date<"2023-09-20", 7,
+                                                    if_else(Date>="2023-09-20" & Date<"2023-09-27", 8,
+                                                    if_else(Date>="2023-09-27" & Date<"2023-10-13", 9,
+                                                    if_else(Date>="2023-10-13" & Date<"2023-10-20", 10, NA))))))))))) %>% 
+  group_by(Interval) %>% 
+  filter(!is.na(Interval)) %>% 
+  summarise(meanTemp=mean(Daily_AvgTemp, na.rm=TRUE), maxTemp=max(Daily_MaxTemp, na.rm = TRUE), 
+            minTemp=min(Daily_MinTemp, na.rm = TRUE), meanDiurnal_Range=mean(Diurnal_Range, na.rm = TRUE))
+```
+
+```{r}
+all.data.clim.for.surv <- all.data.timeprep %>% 
+  mutate(Interval=if_else(survey_date=="2023-07-26", 1,
+                              if_else(survey_date=="2023-08-02", 2,
+                              if_else(survey_date=="2023-08-16", 3,
+                              if_else(survey_date=="2023-08-23", 4,
+                              if_else(survey_date=="2023-08-30", 5,
+                              if_else(survey_date=="2023-09-06", 6,
+                              if_else(survey_date=="2023-09-13", 7,
+                              if_else(survey_date=="2023-09-20", 8,
+                              if_else(survey_date=="2023-09-27", 9,
+                              if_else(survey_date=="2023-10-13", 10, NA))))))))))) %>% 
+  left_join(soil_temp_intervals) %>% 
+  left_join(swc_intervals) %>% 
+  filter(!is.na(Interval))
+head(all.data.clim.for.surv)
+summary(all.data.clim.for.surv)
+names(all.data.clim.for.surv)
+```
+
+```{r}
+all.data.clim.for.growth <- all.data.timeprep %>% 
+  mutate(Interval=if_else(survey_date=="2023-07-26", 1,
+                              if_else(survey_date=="2023-08-02", 2,
+                              if_else(survey_date=="2023-08-16", 3,
+                              if_else(survey_date=="2023-08-23", 4,
+                              if_else(survey_date=="2023-08-30", 5,
+                              if_else(survey_date=="2023-09-06", 6,
+                              if_else(survey_date=="2023-09-13", 7,
+                              if_else(survey_date=="2023-09-20", 8,
+                              if_else(survey_date=="2023-09-27", 9,
+                              if_else(survey_date=="2023-10-13", 10, NA))))))))))) %>% 
+  left_join(soil_temp_intervals) %>% 
+  left_join(swc_intervals) %>% 
+  filter(!is.na(Interval))
+head(all.data.clim.for.growth)
+summary(all.data.clim.for.growth)
+names(all.data.clim.for.growth)
+```
+
+### Survival Models
+
+Instead of weeks or aspect of time in the model, I am going to use an observation random effect (OBRE).
+We need OBRE b/c measure same individuals multiple times over time
+
+```{r}
+priors <- c(prior(normal(0, 10), class = b))
+
+linear.mod = brm(surv ~ 1 + size.log + (1|block) + (1|parent.pop/mf) + (1|Genotype),
+                 family = bernoulli(),
+                 data = all.data.clim.for.surv)
+linear.clim.mod = brm(surv ~ 1 + size.log + minTemp + meanSWC + (1|block) + (1|parent.pop/mf) 
+                      + (1|Genotype),
+                 family = bernoulli(),
+                 data = all.data.clim.for.surv)
+quad.mod = brm(surv ~ 1 + size.log + I(size.log^2) + (1|block) + (1|parent.pop/mf) 
+               + (1|Genotype),
+                family = bernoulli(),
+                 data = all.data.clim.for.surv)
+quad.clim.mod = brm(surv ~ 1 + size.log + I(size.log^2) + minTemp + meanSWC + (1|block) 
+                    + (1|parent.pop/mf) + (1|Genotype),
+                 family = bernoulli(),
+                 data = all.data.clim.for.surv)
+cubic.mod = brm(surv ~ 1 + size.log + I(size.log^2) + I(size.log^3) + (1|block) 
+                + (1|parent.pop/mf) + (1|Genotype),
+                family = bernoulli(),
+                 data = all.data.clim.for.surv)
+cubic.clim.mod = brm(surv ~ 1 + size.log + I(size.log^2) + I(size.log^3) + minTemp + meanSWC 
+                    + (1|block) + (1|parent.pop/mf) + (1|Genotype),
+                 family = bernoulli(),
+                 data = all.data.clim.for.surv)
+
+```
+
+Model Comparison
+
+```{r}
+linear.mod = add_criterion(linear.mod, c("loo", "waic"))
+linear.clim.mod = add_criterion(linear.clim.mod, c("loo", "waic"))
+quad.mod = add_criterion(quad.mod, c("loo", "waic"))
+quad.clim.mod = add_criterion(quad.clim.mod, c("loo", "waic"))
+cubic.mod = add_criterion(cubic.mod, c("loo", "waic"))
+cubic.clim.mod = add_criterion(cubic.clim.mod, c("loo", "waic"))
+```
+
+```{r}
+summary(linear.mod)
+summary(linear.clim.mod)
+summary(quad.mod)
+summary(quad.clim.mod)
+summary(cubic.mod)
+summary(cubic.clim.mod)
+```
+
+Missing interval 10 for soil temperature
+
+```{r}
+loo_compare(linear.mod,quad.mod,cubic.mod, criterion = "loo")
+```
+
+```{r}
+loo_compare(linear.clim.mod,quad.clim.mod,cubic.clim.mod, criterion = "loo")
+```
+
+
+```{r}
+loo_compare(linear.mod,linear.clim.mod,quad.mod,quad.clim.mod,cubic.mod,cubic.clim.mod, criterion = "waic")
+```
+
+```{r}
+loo_compare(linear.mod,linear.clim.mod,quad.mod,quad.clim.mod,cubic.mod,cubic.clim.mod, criterion = "loo")
+```
+
+
+
+
+
+
+
+
+
+
